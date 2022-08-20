@@ -34,7 +34,7 @@ class DialogLMDataset(Dataset):
             num_proc += 1
 
             src = DialogLMDataset.preprocess_text_minimal(
-                txt = row[src_col],
+                txt = str(row[src_col]),
                 dataset_eos_token = src_eos_token,
                 tokenizer_eos_token = self.tokenizer.eos_token
             )

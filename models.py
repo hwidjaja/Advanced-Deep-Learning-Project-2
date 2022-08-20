@@ -257,12 +257,12 @@ class NegativePositiveTrainingLM:
         tokenizer, 
         device, 
         opt_eps = 1e-8, 
-        sched_weight_decay = 0,
+        sched_weight_decay = 0.0,
         sched_num_warmup_steps = 0
     ):
     
-        # self.model = GPT2LMHeadModel.from_pretrained(model_name, config=model_config).to(device)
-        self.model = AutoModelWithLMHead.from_pretrained(model_name, config=model_config).to(device)
+        self.model = GPT2LMHeadModel.from_pretrained(model_name, config=model_config).to(device)
+        # self.model = AutoModelWithLMHead.from_pretrained(model_name, config=model_config).to(device)
         self.model_config = model_config
         self.pos_lr = pos_lr
         self.neg_lr = neg_lr
@@ -273,6 +273,7 @@ class NegativePositiveTrainingLM:
         self.sched_weight_decay = sched_weight_decay
         self.sched_num_warmup_steps = sched_num_warmup_steps
         self.init_optimizers_and_schedulers()
+        self.curr_accum_steps = 0
 
 
     def init_optimizers_and_schedulers(self):
@@ -348,7 +349,7 @@ class NegativePositiveTrainingLM:
             self.reset_optimizers()
 
 
-    def positive_step_basic(self, batch, max_grad_norm=1.0):
+    def positive_step_basic(self, batch, max_grad_norm=1.0, debug=False):
         '''
         Performs a standard (min. negative log likelihood / max. log likelihood)
         gradient update on `self.model` using `batch`.
@@ -357,7 +358,7 @@ class NegativePositiveTrainingLM:
             1. `loss`: the loss of this batch before updating.
         '''
 
-        self.optimizer_pos.zero_grad()
+        # self.optimizer_pos.zero_grad()
 
         # max sequence length
         seq_len = batch['input_ids'].shape[1]
@@ -371,6 +372,7 @@ class NegativePositiveTrainingLM:
         # print(input_ids.shape, position_ids.shape, token_type_ids.shape, target_ids.shape, attention_mask.shape)
 
         # get model outputs
+        self.model.train()  # this changes the outputs somehow!!
         outputs = self.model(
             input_ids = input_ids, 
             # attention_mask = attention_mask,
@@ -379,6 +381,13 @@ class NegativePositiveTrainingLM:
             labels = target_ids
         )
         loss = outputs.loss
+        if debug:
+            print('example input ids: ', input_ids[0], input_ids[0].shape)
+            print('example target ids: ', target_ids[0], target_ids[0].shape)
+            print('example inputs: ', self.tokenizer.decode(input_ids[0]))
+            print('example targets:', self.tokenizer.decode(target_ids[0]))
+            print('model output logits:', outputs.logits)
+            print('model loss:', loss)
 
         # # calculate the negative loss
         # loss = CausalLM._calculate_mle_loss(
@@ -393,13 +402,14 @@ class NegativePositiveTrainingLM:
 
         self.optimizer_pos.step()
         self.scheduler_pos.step()
+        self.model.zero_grad()
         
         return  {
             'loss': loss
         }
 
     
-    def positive_step(self, batch):
+    def positive_step(self, batch, max_grad_norm=1.0, grad_accum_steps=64, debug=False):
         '''
         Performs a standard (min. negative log likelihood / max. log likelihood)
         gradient update on `self.model` using `batch`.
@@ -408,7 +418,7 @@ class NegativePositiveTrainingLM:
             1. `loss`: the loss of this batch before updating.
         '''
 
-        self.optimizer_pos.zero_grad()
+        # self.optimizer_pos.zero_grad()
 
         # max sequence length
         seq_len = batch['input_ids'].shape[1]
@@ -422,6 +432,7 @@ class NegativePositiveTrainingLM:
         # print(input_ids.shape, position_ids.shape, token_type_ids.shape, target_ids.shape, attention_mask.shape)
 
         # get model outputs
+        self.model.train()  # Best practices - ALWAYS call this just before making gradient updates!
         outputs = self.model(
             input_ids = input_ids, 
             attention_mask = attention_mask,
@@ -436,11 +447,30 @@ class NegativePositiveTrainingLM:
             labels = target_ids,  # (batch_size, seq_len, vocab_size)
             ignore_index = -100   # TODO: remove this magic number
         )
+        if debug:
+            print('example input ids: ', input_ids[0], input_ids[0].shape)
+            print('example target ids: ', target_ids[0], target_ids[0].shape)
+            print('example inputs: ', self.tokenizer.decode(input_ids[0]))
+            print('example targets:', self.tokenizer.decode(target_ids[0]))
+            print('model output logits:', outputs.logits)
+            print('model loss:', loss)
+
         loss.backward()
-        
-        # consider gradient clipping here before updating
-        
-        self.optimizer_pos.step()
+
+        if self.curr_accum_steps == grad_accum_steps:
+
+            print(f'\rMaking gradient update...', end='', flush=True)
+
+            # gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+
+            self.optimizer_pos.step()
+            self.scheduler_pos.step()
+            self.model.zero_grad()
+
+            self.curr_accum_steps = 0
+        else:
+            self.curr_accum_steps += 1
         
         return  {
             'loss': loss
@@ -449,6 +479,7 @@ class NegativePositiveTrainingLM:
     
     def negative_step(
         self, batch, 
+        max_grad_norm = 1.0,
         EXAMPLE_WEIGHT_MODE = 'decay',
         EXAMPLE_WEIGHT_CARE_MODE = 'sample_min', 
         EXAMPLE_WEIGHT_REJECTION_THRESHOLD = -5.0
@@ -471,7 +502,7 @@ class NegativePositiveTrainingLM:
             :param `average_nll_true_labels`: the negative log-likelihood (the usual loss metric) of the labels.  
         '''
 
-        self.optimizer_neg.zero_grad()
+        # self.optimizer_neg.zero_grad()
 
         # max sequence length
         seq_len = batch['input_ids'].shape[1]
@@ -485,6 +516,7 @@ class NegativePositiveTrainingLM:
         # print(input_ids.shape, position_ids.shape, token_type_ids.shape, target_ids.shape, attention_mask.shape)
 
         # get model outputs
+        self.model.train()  # Best practices - ALWAYS call this just before making gradient updates!
         outputs = self.model(
             input_ids = input_ids, 
             attention_mask = attention_mask,
@@ -504,9 +536,12 @@ class NegativePositiveTrainingLM:
         )
         loss.backward()
         
-        # consider gradient clipping here before updating
-        
-        self.optimizer_neg.step()
+        # gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+
+        self.optimizer_pos.step()
+        self.scheduler_pos.step()
+        self.model.zero_grad()
         
         return {
             'loss': loss,
@@ -536,34 +571,70 @@ class NegativePositiveTrainingLM:
         seq_len = batch['input_ids'].shape[1]
         
         # each tensor to device
-        input_ids       = batch['input_ids'].to(self.device)
-        position_ids    = batch['position_ids'].to(self.device)
-        token_type_ids  = batch['token_type_ids'].to(self.device)
-        target_ids      = batch['target_ids'].to(self.device)
-        attention_mask  = batch['attention_masks'].to(self.device)
-        # print(input_ids.shape, position_ids.shape, token_type_ids.shape, target_ids.shape, attention_mask.shape)
+        with torch.no_grad():
+            input_ids       = batch['input_ids'].to(self.device)
+            position_ids    = batch['position_ids'].to(self.device)
+            token_type_ids  = batch['token_type_ids'].to(self.device)
+            attention_mask  = batch['attention_masks'].to(self.device)
+            target_ids      = batch['target_ids'].to(self.device)
+            # print(input_ids.shape, position_ids.shape, token_type_ids.shape, target_ids.shape, attention_mask.shape)
 
-        # get model outputs
-        outputs = self.model(
-            input_ids = input_ids, 
-            attention_mask = attention_mask,
-            token_type_ids = token_type_ids,
-            position_ids = position_ids,
-            labels = target_ids
-        )
-        
-        # calculate the masked logprobs
-        masked_logprobs_of_true_labels, ignore_index_mask = \
-        NegativePositiveTrainingLM._calculate_masked_logprobs(
-            logits = outputs.logits,  # (batch_size, seq_len)
-            labels = target_ids,  # (batch_size, seq_len, vocab_size)
-            ignore_index = -100,  # TODO: remove this magic number
-        )
-        
+            # get model outputs
+            outputs = self.model(
+                input_ids = input_ids, 
+                attention_mask = attention_mask,
+                token_type_ids = token_type_ids,
+                position_ids = position_ids,
+                labels = target_ids
+            )
+            
+            # calculate the masked logprobs
+            masked_logprobs_of_true_labels, ignore_index_mask = \
+            NegativePositiveTrainingLM._calculate_masked_logprobs(
+                logits = outputs.logits,  # (batch_size, seq_len)
+                labels = target_ids,  # (batch_size, seq_len, vocab_size)
+                ignore_index = -100,  # TODO: remove this magic number
+            )
+            
         return  {
             'masked_logprobs': masked_logprobs_of_true_labels,  # (batch_size, seq_len)
             'ignore_index_mask': ignore_index_mask  # (batch_size, seq_len)
         }
+
+
+    def perplexity_on_dataset_basic(self, dataloader):
+        self.model.eval()
+        batch_wise_losses = []
+        eval_loss = 0.0
+        nb_eval_steps = 0
+        len_loader = len(dataloader)
+
+        for batch_id, batch in enumerate(dataloader):
+            
+            if batch_id % 10 == 0:
+                print(f'\rEvaluating batch: {batch_id} of {len_loader}', end='', flush=True)
+
+            # each tensor to device
+            input_ids       = batch['input_ids'].to(self.device)
+            target_ids      = batch['target_ids'].to(self.device)
+            
+            with torch.no_grad():
+                # get model outputs
+                outputs = self.model(
+                    input_ids = input_ids,
+                    labels = target_ids
+                )
+                lm_loss = outputs[0]
+                # print(lm_loss)
+                eval_loss += lm_loss.mean().item()
+            nb_eval_steps += 1
+
+        eval_loss = eval_loss / nb_eval_steps
+        perplexity = torch.exp(torch.tensor(eval_loss))
+
+        result = {"perplexity": perplexity}
+            
+        return perplexity
 
 
     def perplexity_on_dataset(self, dataloader):
@@ -588,8 +659,12 @@ class NegativePositiveTrainingLM:
                     input_ids = input_ids,
                     labels = target_ids
                 )
-                lm_loss = outputs[0]
-                print(lm_loss)
+                lm_loss = NegativePositiveTrainingLM._calculate_positive_phase_loss(
+                    logits = outputs.logits,  # (batch_size, seq_len)
+                    labels = target_ids,  # (batch_size, seq_len, vocab_size)
+                    ignore_index = -100   # TODO: remove this magic number
+                )
+                # print(lm_loss)
                 eval_loss += lm_loss.mean().item()
             nb_eval_steps += 1
 
